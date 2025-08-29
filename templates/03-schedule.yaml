@@ -1,0 +1,141 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Encendido 09:00 y apagado 18:05 (L–V, America/Guayaquil) de la instancia DEV usando
+  EventBridge (cron en UTC) + Lambda que llama StartInstances/StopInstances.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: wp-course-project
+  Environment:
+    Type: String
+    AllowedValues: [prod, dev]
+    Default: dev
+  InstanceId:
+    Type: String
+    Description: ID de la instancia EC2 a controlar (de Outputs de wordpress-app-dev)
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+
+Resources:
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-${Environment}-startstop"
+      RetentionInDays: !Ref LogRetentionDays
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: lambda-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+        - PolicyName: ec2-start-stop
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:StartInstances
+                  - ec2:StopInstances
+                Resource: "*"
+
+  StartStopFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${Environment}-startstop"
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 30
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+        Variables:
+          INSTANCE_ID: !Ref InstanceId
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+
+          ec2 = boto3.client('ec2')
+          INSTANCE_ID = os.environ['INSTANCE_ID']
+
+          def handler(event, context):
+            action = (event or {}).get('action')
+            if action == 'start':
+              ec2.start_instances(InstanceIds=[INSTANCE_ID])
+              return {'status': 'started', 'instance': INSTANCE_ID}
+            if action == 'stop':
+              ec2.stop_instances(InstanceIds=[INSTANCE_ID])
+              return {'status': 'stopped', 'instance': INSTANCE_ID}
+            return {'status': 'noop', 'msg': 'missing or invalid action', 'event': event}
+
+  # Regla para iniciar 09:00 America/Guayaquil (14:00 UTC) L–V
+  StartRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-start-0900-GYE"
+      ScheduleExpression: "cron(0 14 ? * MON-FRI *)"
+      State: ENABLED
+      Description: "Start DEV instance at 09:00 America/Guayaquil (14:00 UTC)"
+      Targets:
+        - Id: StartTarget
+          Arn: !GetAtt StartStopFunction.Arn
+          Input: '{"action":"start"}'
+
+  # Regla para apagar 18:05 America/Guayaquil (23:05 UTC) L–V
+  StopRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-stop-1805-GYE"
+      ScheduleExpression: "cron(5 23 ? * MON-FRI *)"
+      State: ENABLED
+      Description: "Stop DEV instance at 18:05 America/Guayaquil (23:05 UTC)"
+      Targets:
+        - Id: StopTarget
+          Arn: !GetAtt StartStopFunction.Arn
+          Input: '{"action":"stop"}'
+
+  # Permisos para que EventBridge invoque la Lambda
+  AllowEventsInvokeStart:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StartStopFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt StartRule.Arn
+
+  AllowEventsInvokeStop:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StartStopFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt StopRule.Arn
+
+Outputs:
+  FunctionName:
+    Description: Lambda que enciende/apaga la instancia DEV
+    Value: !Ref StartStopFunction
+  StartRuleName:
+    Description: Regla de inicio (09:00 GYE)
+    Value: !Ref StartRule
+  StopRuleName:
+    Description: Regla de apagado (18:05 GYE)
+    Value: !Ref StopRule
