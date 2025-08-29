@@ -1,0 +1,295 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  WordPress en una sola instancia EC2 dentro de subred PRIVADA, detrás de un ALB público.
+  Incluye SGs, IAM (SSM + CloudWatch Agent), Log Groups, y UserData para LAMP+WordPress.
+  Importa VPC/Subredes del stack de red vía Fn::ImportValue.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: wp-course-project
+  Environment:
+    Type: String
+    AllowedValues: [prod, dev]
+    Default: dev
+  NetworkStackName:
+    Type: String
+    Description: Nombre del stack de red (para ImportValue de Vpc/Subnets)
+    Default: wordpress-network-dev
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues: [t3.micro, t3.small, t3.medium, t3.large]
+  AmiId:
+    Type: AWS::EC2::Image::Id
+    Description: AMI para EC2 (Amazon Linux 2 en us-east-1 por defecto).
+    Default: ami-0c101f26f147fa7fd
+  AdminCidr:
+    Type: String
+    Description: CIDR para permitir SSH (22) hacia la instancia (ej. 200.10.20.30/32)
+    Default: 0.0.0.0/0
+  KeyName:
+    Type: String
+    Default: ""
+    Description: (Opcional) KeyPair para acceso SSH
+  AppLogRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+
+Conditions:
+  HasKeyPair: !Not [!Equals [!Ref KeyName, ""]]
+
+Mappings:
+  RegionMap:
+    us-east-1:
+      AL2HTTPD: httpd
+      AL2PHP: "php php-mysqlnd php-gd php-xml php-mbstring"
+      AL2MARIADB: mariadb-server
+
+Resources:
+  # Log Group para la app
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${ProjectName}/${Environment}/app-${AWS::StackName}"
+      RetentionInDays: !Ref AppLogRetentionDays
+
+  # IAM para la instancia (SSM + CloudWatch Agent)
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Path: "/"
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+      Path: "/"
+
+  # Security Groups
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB SG
+      VpcId: !ImportValue
+        Fn::Sub: "${NetworkStackName}-VpcId"
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-${Environment}-alb-sg" }
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EC2 WordPress SG (privado)
+      VpcId: !ImportValue
+        Fn::Sub: "${NetworkStackName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AdminCidr
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-${Environment}-app-sg" }
+
+  # EC2 en subred PRIVADA
+  AppInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      IamInstanceProfile: !Ref InstanceProfile
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: false
+          DeviceIndex: 0
+          GroupSet: [!Ref AppSecurityGroup]
+          SubnetId: !ImportValue
+            Fn::Sub: "${NetworkStackName}-PrivateSubnetId"
+      KeyName: !If [HasKeyPair, !Ref KeyName, !Ref AWS::NoValue]
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: { VolumeSize: 16, VolumeType: gp3, Encrypted: true }
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-${Environment}-wp" }
+      UserData:
+        Fn::Base64:
+          !Sub
+            - |
+              #!/bin/bash -xe
+              yum update -y
+              yum install -y ${AL2HTTPD} ${AL2MARIADB} ${AL2PHP} amazon-cloudwatch-agent
+
+              systemctl enable httpd
+              systemctl start httpd
+
+              systemctl enable mariadb
+              systemctl start mariadb
+
+              # Asegurar MariaDB (simple para demo)
+              mysql -e "UPDATE mysql.user SET Password=PASSWORD('WpRoot#123') WHERE User='root'; FLUSH PRIVILEGES;" || true
+              mysql -uroot -pWpRoot#123 -e "CREATE DATABASE wordpress;"
+
+              cd /tmp
+              curl -O https://wordpress.org/latest.tar.gz
+              tar -xzf latest.tar.gz
+              cp -r wordpress/* /var/www/html/
+              chown -R apache:apache /var/www/html
+              chmod -R 755 /var/www/html
+
+              cp /var/www/html/wp-config-sample.php /var/www/html/wp-config.php
+              sed -i "s/database_name_here/wordpress/" /var/www/html/wp-config.php
+              sed -i "s/username_here/root/" /var/www/html/wp-config.php
+              sed -i "s/password_here/WpRoot#123/" /var/www/html/wp-config.php
+              sed -i "s/localhost/127.0.0.1/" /var/www/html/wp-config.php
+
+              # CloudWatch Agent config
+              cat <<'CFG' > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+              {
+                "logs": {
+                  "logs_collected": {
+                    "files": {
+                      "collect_list": [
+                        {"file_path":"/var/log/messages","log_group_name":"/${ProjectName}/${Environment}/app-${AWS::StackName}","log_stream_name":"messages","timestamp_format":"%b %d %H:%M:%S"},
+                        {"file_path":"/var/log/httpd/access_log","log_group_name":"/${ProjectName}/${Environment}/app-${AWS::StackName}","log_stream_name":"httpd-access"},
+                        {"file_path":"/var/log/httpd/error_log","log_group_name":"/${ProjectName}/${Environment}/app-${AWS::StackName}","log_stream_name":"httpd-error"}
+                      ]
+                    }
+                  }
+                },
+                "metrics": {
+                  "append_dimensions": {"InstanceId":"${InstanceIdToken}"},
+                  "metrics_collected": {
+                    "mem": {"measurement": ["mem_used_percent"], "metrics_collection_interval": 60},
+                    "disk": {"measurement": ["used_percent"], "resources": ["*"], "metrics_collection_interval": 60},
+                    "cpu": {"measurement": ["usage_system","usage_user","usage_idle"], "metrics_collection_interval": 60}
+                  }
+                }
+              }
+              CFG
+
+              systemctl restart amazon-cloudwatch-agent || /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+
+              # Permitir que httpd sirva index.php por defecto
+              sed -i 's/DirectoryIndex index.html/DirectoryIndex index.php index.html/g' /etc/httpd/conf/httpd.conf
+              systemctl restart httpd
+            - {
+                AL2HTTPD: !FindInMap [RegionMap, !Ref 'AWS::Region', AL2HTTPD],
+                AL2MARIADB: !FindInMap [RegionMap, !Ref 'AWS::Region', AL2MARIADB],
+                AL2PHP: !FindInMap [RegionMap, !Ref 'AWS::Region', AL2PHP],
+                InstanceIdToken: '${!aws:InstanceId}'
+              }
+
+  # Target Group (instancia) – registra la EC2 como target aquí (Targets)
+  AppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !ImportValue
+        Fn::Sub: "${NetworkStackName}-VpcId"
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckPath: /health.html
+      Matcher:
+        HttpCode: '200'
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 6
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Targets:
+        - Id: !Ref AppInstance
+          Port: 80
+
+  # ALB público (requiere 2 subredes)
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Subnets:
+        - !ImportValue
+          Fn::Sub: "${NetworkStackName}-PublicSubnetId"
+        - !ImportValue
+          Fn::Sub: "${NetworkStackName}-PublicSubnetIdB"
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      Type: application
+      IpAddressType: ipv4
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-${Environment}-alb" }
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref AppTargetGroup }]
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # SNS + Alarmas
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-${Environment}-alarms"
+
+  HighCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: CPU > 80% por 5 min
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - { Name: InstanceId, Value: !Ref AppInstance }
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: [!Ref AlarmTopic]
+
+  Alb5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Respuestas 5xx del ALB elevadas
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_ELB_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [!Ref AlarmTopic]
+
+Outputs:
+  AlbDNSName:
+    Description: DNS público del ALB
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+  InstanceId:
+    Description: ID de la instancia EC2 de WordPress (privada)
+    Value: !Ref AppInstance
+  AppSecurityGroupId:
+    Description: SG de la instancia
+    Value: !Ref AppSecurityGroup
+  AlbSecurityGroupId:
+    Description: SG del ALB
+    Value: !Ref AlbSecurityGroup
+  AppLogGroupName:
+    Description: Log Group de la app
+    Value: !Ref AppLogGroup
