@@ -1,0 +1,386 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Proyecto WordPress – Red de base: VPC con 1 Subred Pública (para ALB/NAT) y 1 Subred
+  Privada (para EC2 WordPress). Incluye IGW, NAT Gateway opcional, tablas de ruteo y VPC Flow Logs.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: wp-course-project
+    Description: Nombre base para etiquetar recursos.
+  Environment:
+    Type: String
+    AllowedValues: [prod, dev]
+    Default: prod
+    Description: Entorno (prod o dev) para etiquetar recursos.
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: ^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\/\d{1,2}$
+    Description: CIDR del VPC.
+  PublicSubnetCidr:
+    Type: String
+    Default: 10.0.0.0/24
+    Description: CIDR de la subred pública.
+  PublicSubnetCidrB:
+    Type: String
+    Default: 10.1.2.0/24
+    Description: CIDR de la subred pública B (segunda AZ).
+  PrivateSubnetCidr:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: CIDR de la subred privada.
+  CreateNatGateway:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: Crea un NAT Gateway para salida a Internet desde la subred privada.
+  EnableVpcFlowLogs:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: Habilita VPC Flow Logs hacia CloudWatch Logs.
+  LogRetentionInDays:
+    Type: Number
+    Default: 30
+    Description: Retención en días del Log Group (CloudWatch Logs).
+
+Conditions:
+  UseNat: !Equals [!Ref CreateNatGateway, "true"]
+  UseFlowLogs: !Equals [!Ref EnableVpcFlowLogs, "true"]
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Identidad
+        Parameters: [ProjectName, Environment]
+      - Label:
+          default: Red (CIDRs)
+        Parameters: [VpcCidr, PublicSubnetCidr, PrivateSubnetCidr]
+      - Label:
+          default: Opciones
+        Parameters: [CreateNatGateway, EnableVpcFlowLogs, LogRetentionInDays]
+    ParameterLabels:
+      ProjectName:
+        default: Nombre del Proyecto
+      Environment:
+        default: Entorno
+      VpcCidr:
+        default: CIDR del VPC
+      PublicSubnetCidr:
+        default: CIDR Subred Pública
+      PrivateSubnetCidr:
+        default: CIDR Subred Privada
+      CreateNatGateway:
+        default: Crear NAT Gateway
+      EnableVpcFlowLogs:
+        default: Activar VPC Flow Logs
+      LogRetentionInDays:
+        default: Retención (días)
+
+Resources:
+  # -----------------------------
+  # CloudWatch Logs – Log Group (red/infra)
+  # -----------------------------
+  VpcLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      # Nombre único por stack para evitar colisiones si ya existe un Log Group previo
+      LogGroupName: !Sub "/${ProjectName}/${Environment}/network-${AWS::StackName}"
+      RetentionInDays: !Ref LogRetentionInDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # -------------------------------------------------
+  # IAM Role para entrega de VPC Flow Logs a CloudWatch
+  # -------------------------------------------------
+  VpcFlowLogsRole:
+    Type: AWS::IAM::Role
+    Condition: UseFlowLogs
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [vpc-flow-logs.amazonaws.com]
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: flowlogs-to-cwl
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # -----------------------------
+  # VPC y componentes de red
+  # -----------------------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-vpc
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-igw
+
+  AttachIgw:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnetCidr
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-public-a
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Tier
+          Value: public
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnetCidrB
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-public-b
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Tier
+          Value: public
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnetCidr
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-private-a
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Tier
+          Value: private
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-rtb-public
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachIgw
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    Condition: UseNat
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-nat-eip
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Condition: UseNat
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-natgw
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-rtb-private
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: UseNat
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  # -----------------------------
+  # VPC Flow Logs
+  # -----------------------------
+  VpcFlowLog:
+    Type: AWS::EC2::FlowLog
+    Condition: UseFlowLogs
+    Properties:
+      DeliverLogsPermissionArn: !GetAtt VpcFlowLogsRole.Arn
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref VpcLogGroup
+      ResourceId: !Ref VPC
+      ResourceType: VPC
+      TrafficType: ALL
+      MaxAggregationInterval: 60
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-vpc-flow-logs
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # -------------------------------------------------
+  # IAM Role para entregar VPC Flow Logs a CloudWatch
+  # -------------------------------------------------
+  VpcFlowLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: flowlogs-to-cwl
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # -----------------------------
+  # VPC Flow Logs -> CloudWatch
+  # -----------------------------
+  VpcFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      DeliverLogsPermissionArn: !GetAtt VpcFlowLogsRole.Arn
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref VpcLogGroup
+      ResourceId: !Ref VPC
+      ResourceType: VPC
+      TrafficType: ALL
+      MaxAggregationInterval: 60
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-vpc-flow-logs
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  LogGroupName:
+    Description: Log Group de CloudWatch para red (VPC Flow Logs y futuros logs)
+    Value: !Ref VpcLogGroup
+  VpcId:
+    Description: ID del VPC creado
+    Value: !Ref VPC
+    Export:
+      Name: !Sub ${AWS::StackName}-VpcId
+  PublicSubnetId:
+    Description: ID de la Subred Pública (para ALB y NAT)
+    Value: !Ref PublicSubnet
+    Export:
+      Name: !Sub ${AWS::StackName}-PublicSubnetId
+  PublicSubnetIdB:
+    Description: ID de la Subred Pública B (ALB requiere 2 AZs)
+    Value: !Ref PublicSubnetB
+    Export:
+      Name: !Sub ${AWS::StackName}-PublicSubnetIdB
+  PrivateSubnetId:
+    Description: ID de la Subred Privada (para EC2 WordPress)
+    Value: !Ref PrivateSubnet
+    Export:
+      Name: !Sub ${AWS::StackName}-PrivateSubnetId
+  PublicRouteTableId:
+    Description: Tabla de ruteo pública
+    Value: !Ref PublicRouteTable
+  PrivateRouteTableId:
+    Description: Tabla de ruteo privada
+    Value: !Ref PrivateRouteTable
+  NatGatewayId:
+    Condition: UseNat
+    Description: NAT Gateway (si se creó)
+    Value: !Ref NatGateway
