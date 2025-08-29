@@ -15,7 +15,7 @@ CloudFormation templates to deploy a single WordPress EC2 instance **in a privat
 .
 ├── 01-network.yaml        # VPC, subnets, IGW, NAT, VPC Flow Logs → CloudWatch
 ├── 02-wordpress.yaml      # EC2 (private), ALB (public), TG, SGs, IAM, logs, alarms
-└── 03-schedule-dev.yaml   # EventBridge (UTC cron) + Lambda start/stop
+└── 03-schedule.yaml   # EventBridge (UTC cron) + Lambda start/stop
 ```
 
 ## Prerequisites
@@ -60,7 +60,7 @@ EventBridge cron is evaluated in **UTC**. America/Guayaquil (UTC−5):
 ```bash
 INSTANCE_ID=$(aws cloudformation describe-stacks   --stack-name wordpress-app-dev   --query "Stacks[0].Outputs[?OutputKey=='InstanceId'].OutputValue"   --output text --region us-east-1)
 
-aws cloudformation deploy   --stack-name wordpress-schedule-dev   --template-file 03-schedule-dev.yaml   --parameter-overrides       ProjectName=wp-course-project       Environment=dev       InstanceId=$INSTANCE_ID   --capabilities CAPABILITY_NAMED_IAM   --region us-east-1
+aws cloudformation deploy   --stack-name wordpress-schedule   --template-file 03-schedule-dev.yaml   --parameter-overrides       ProjectName=wp-course-project       Environment=dev       InstanceId=$INSTANCE_ID   --capabilities CAPABILITY_NAMED_IAM   --region us-east-1
 ```
 
 **Manual test:**
@@ -103,7 +103,7 @@ aws ec2 wait instance-running --instance-ids $INSTANCE_ID --region us-east-1
 
 **Key outputs:** `AlbDNSName`, `InstanceId`, `AppSecurityGroupId`, `AlbSecurityGroupId`, `AppLogGroupName`.
 
-### `03-schedule-dev.yaml`
+### `03-schedule.yaml`
 | Name | Type | Default | Description |
 |---|---|---|---|
 | `ProjectName` | String | `wp-course-project` | Tagging prefix. |
@@ -137,7 +137,7 @@ aws ec2 wait instance-running --instance-ids $INSTANCE_ID --region us-east-1
 
 ## Cleanup
 
-1. Delete stack `wordpress-schedule-dev`.  
+1. Delete stack `wordpress-schedule`.  
 2. Delete stack `wordpress-app-dev`.  
 3. Delete stack `wordpress-network-dev`.
 
